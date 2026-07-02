@@ -821,6 +821,60 @@ class AgentOrchestrator:
             return overridden
         return dashboard
 
+    def _apply_atr_stop_loss(
+        self,
+        sniper: Dict[str, Any],
+        ctx: AgentContext,
+    ) -> None:
+        """
+        用 ATR 动态止损覆盖 LLM 给出的止损价（波动率自适应）。
+
+        逻辑：
+        - 从 trend_result 提取 ATR（兼容 dict 与 TrendAnalysisResult 对象）
+        - 入场价优先取 sniper.ideal_buy，回退 trend_result.current_price
+        - 止损 = 入场价 - 2 × ATR
+        - 仅在 ATR 有效、止损为正且低于入场价时覆盖；否则保留原值（LLM 或 key_levels 兜底）
+        - 写入 stop_loss_method 标记止损来源，便于回测与展示识别
+        """
+        trend_result = ctx.get_data("trend_result")
+        if not trend_result:
+            return
+
+        # 稳健提取 ATR 与现价（兼容 dict / dataclass 对象）
+        if isinstance(trend_result, dict):
+            raw_atr = trend_result.get("atr")
+            raw_price = trend_result.get("current_price")
+        else:
+            raw_atr = getattr(trend_result, "atr", None)
+            raw_price = getattr(trend_result, "current_price", None)
+
+        try:
+            atr_value = float(raw_atr)
+        except (TypeError, ValueError):
+            return
+        if atr_value <= 0:
+            return
+
+        # 入场价：优先 ideal_buy（理想买点），无效时回退现价
+        entry_price = _coerce_level_value(sniper.get("ideal_buy"))
+        if not entry_price or entry_price <= 0:
+            try:
+                entry_price = float(raw_price)
+            except (TypeError, ValueError):
+                entry_price = 0.0
+        if not entry_price or entry_price <= 0:
+            return
+
+        multiplier = 2.0  # ATR 止损倍数（经典 2 倍波动幅度）
+        atr_stop = round(entry_price - multiplier * atr_value, 2)
+
+        # 合理性校验：止损须为正且严格低于入场价，否则不覆盖
+        if atr_stop <= 0 or atr_stop >= entry_price:
+            return
+
+        sniper["stop_loss"] = atr_stop
+        sniper["stop_loss_method"] = f"ATR×{multiplier:g}"
+
     def _normalize_dashboard_payload(
         self,
         payload: Optional[Dict[str, Any]],
@@ -962,6 +1016,9 @@ class AgentOrchestrator:
             or key_levels.get("resistance")
             or "N/A",
         )
+
+        # ATR 动态止损：用波动率自适应的算法止损覆盖 LLM 的随意值（若有 ATR 数据）
+        self._apply_atr_stop_loss(sniper, ctx)
 
         risk_alerts = self._collect_risk_alerts(ctx, intelligence)
         positive_catalysts = self._collect_positive_catalysts(ctx, intelligence)

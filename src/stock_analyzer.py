@@ -126,6 +126,11 @@ class TrendAnalysisResult:
     rsi_status: RSIStatus = RSIStatus.NEUTRAL
     rsi_signal: str = ""              # RSI 信号描述
 
+    # ATR 指标（真实波动幅度，用于动态止损）
+    atr: float = 0.0              # ATR(14) 原始值
+    atr_ratio: float = 0.0        # ATR / 现价 × 100（波动率百分比，便于跨股比较）
+    atr_signal: str = ""            # ATR 信号描述
+
     # 买入信号
     buy_signal: BuySignal = BuySignal.WAIT
     signal_score: int = 0            # 综合评分 0-100
@@ -165,6 +170,9 @@ class TrendAnalysisResult:
             'rsi_24': self.rsi_24,
             'rsi_status': self.rsi_status.value,
             'rsi_signal': self.rsi_signal,
+            'atr': self.atr,
+            'atr_ratio': self.atr_ratio,
+            'atr_signal': self.atr_signal,
         }
 
 
@@ -197,6 +205,10 @@ class StockTrendAnalyzer:
     RSI_LONG = 24              # 长期RSI周期
     RSI_OVERBOUGHT = 70        # 超买阈值
     RSI_OVERSOLD = 30          # 超卖阈值
+
+    # ATR 参数（真实波动幅度，用于动态止损）
+    ATR_PERIOD = 14            # ATR 计算周期（Wilder 原始口径）
+    ATR_STOP_MULTIPLIER = 2.0  # 止损倍数：止损 = 入场价 - ATR × 该系数
     
     def __init__(self):
         """初始化分析器"""
@@ -226,9 +238,10 @@ class StockTrendAnalyzer:
         # 计算均线
         df = self._calculate_mas(df)
 
-        # 计算 MACD 和 RSI
+        # 计算 MACD、RSI 和 ATR
         df = self._calculate_macd(df)
         df = self._calculate_rsi(df)
+        df = self._calculate_atr(df)
 
         # 获取最新数据
         latest = df.iloc[-1]
@@ -256,7 +269,10 @@ class StockTrendAnalyzer:
         # 6. RSI 分析
         self._analyze_rsi(df, result)
 
-        # 7. 生成买入信号
+        # 7. ATR 分析（波动率，用于动态止损）
+        self._analyze_atr(df, result)
+
+        # 8. 生成买入信号
         self._generate_signal(result)
 
         return result
@@ -336,6 +352,68 @@ class StockTrendAnalyzer:
             df[col_name] = rsi
 
         return df
+
+    def _calculate_atr(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        计算 ATR 指标（真实波动幅度，Wilder 平滑口径）
+
+        公式：
+        - TR = max(high - low, |high - prev_close|, |low - prev_close|)
+        - ATR = TR 的 Wilder 平滑（ewm(alpha=1/period, adjust=False)，与 RSI 一致）
+
+        说明：
+        - ATR 衡量价格波动幅度，用于设置"波动率自适应"的动态止损
+        - 波动大的股票 ATR 大，止损相应放宽；波动小的股票止损收紧
+        - 首根 K 线无 prev_close，TR 取 high - low（pd.concat.max 默认跳过 NaN）
+        """
+        df = df.copy()
+
+        prev_close = df['close'].shift(1)
+        true_range = pd.concat([
+            df['high'] - df['low'],
+            (df['high'] - prev_close).abs(),
+            (df['low'] - prev_close).abs(),
+        ], axis=1).max(axis=1)
+
+        col_name = f'ATR_{self.ATR_PERIOD}'
+        df[col_name] = true_range.ewm(alpha=1 / self.ATR_PERIOD, adjust=False).mean()
+
+        return df
+
+    def _analyze_atr(self, df: pd.DataFrame, result: TrendAnalysisResult) -> None:
+        """
+        分析 ATR 指标
+
+        核心用途：
+        - 产出 ATR 原始值与波动率百分比（atr_ratio = ATR / 现价 × 100）
+        - 给出波动等级描述，辅助下游（orchestrator）设置动态止损
+        """
+        # ATR 需要至少 ATR_PERIOD + 1 根 K 线（首根无 prev_close）
+        if len(df) < self.ATR_PERIOD + 1:
+            result.atr_signal = "数据不足"
+            return
+
+        latest = df.iloc[-1]
+        col_name = f'ATR_{self.ATR_PERIOD}'
+        atr_value = float(latest[col_name])
+
+        # 容错：数据异常（NaN 或非正）时不参与止损计算
+        if atr_value != atr_value or atr_value <= 0:
+            result.atr_signal = "数据异常，无法计算波动率"
+            return
+
+        result.atr = atr_value
+        if result.current_price > 0:
+            result.atr_ratio = atr_value / result.current_price * 100
+
+        # 波动等级描述（占价比越高，波动越剧烈）
+        ratio = result.atr_ratio
+        if ratio >= 5.0:
+            result.atr_signal = f"⚠️ 波动剧烈(ATR {atr_value:.2f}，占价 {ratio:.1f}%)，止损宜放宽"
+        elif ratio >= 2.5:
+            result.atr_signal = f"📊 波动适中(ATR {atr_value:.2f}，占价 {ratio:.1f}%)"
+        else:
+            result.atr_signal = f"✅ 波动较小(ATR {atr_value:.2f}，占价 {ratio:.1f}%)，止损可收紧"
     
     def _analyze_trend(self, df: pd.DataFrame, result: TrendAnalysisResult) -> None:
         """
@@ -782,6 +860,11 @@ class StockTrendAnalyzer:
             f"   RSI(12): {result.rsi_12:.1f}",
             f"   RSI(24): {result.rsi_24:.1f}",
             f"   信号: {result.rsi_signal}",
+            f"",
+            f"📊 ATR波动率:",
+            f"   ATR(14): {result.atr:.2f}",
+            f"   占价比: {result.atr_ratio:.1f}%",
+            f"   信号: {result.atr_signal}",
             f"",
             f"🎯 操作建议: {result.buy_signal.value}",
             f"   综合评分: {result.signal_score}/100",
