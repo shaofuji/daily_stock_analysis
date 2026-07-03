@@ -131,6 +131,13 @@ class TrendAnalysisResult:
     atr_ratio: float = 0.0        # ATR / 现价 × 100（波动率百分比，便于跨股比较）
     atr_signal: str = ""            # ATR 信号描述
 
+    # ADX 指标（平均趋向指标，衡量趋势强度，不分多空）
+    adx: float = 0.0              # ADX(14) 趋势强度
+    plus_di: float = 0.0          # +DI 多头方向指标
+    minus_di: float = 0.0         # -DI 空头方向指标
+    adx_status: str = ""           # 趋势强度状态（强趋势 / 趋势形成中 / 无趋势）
+    adx_signal: str = ""            # ADX 信号描述
+
     # 买入信号
     buy_signal: BuySignal = BuySignal.WAIT
     signal_score: int = 0            # 综合评分 0-100
@@ -173,6 +180,11 @@ class TrendAnalysisResult:
             'atr': self.atr,
             'atr_ratio': self.atr_ratio,
             'atr_signal': self.atr_signal,
+            'adx': self.adx,
+            'plus_di': self.plus_di,
+            'minus_di': self.minus_di,
+            'adx_status': self.adx_status,
+            'adx_signal': self.adx_signal,
         }
 
 
@@ -209,6 +221,11 @@ class StockTrendAnalyzer:
     # ATR 参数（真实波动幅度，用于动态止损）
     ATR_PERIOD = 14            # ATR 计算周期（Wilder 原始口径）
     ATR_STOP_MULTIPLIER = 2.0  # 止损倍数：止损 = 入场价 - ATR × 该系数
+
+    # ADX 参数（平均趋向指标，衡量趋势强度，不分多空方向）
+    ADX_PERIOD = 14            # ADX 计算周期（Wilder 原始口径，与 ATR 一致）
+    ADX_STRONG_TREND = 25.0    # 强趋势阈值（≥ 此值视为趋势行情，适合趋势策略）
+    ADX_WEAK_TREND = 20.0      # 无趋势阈值（< 此值视为震荡行情，趋势策略易反复亏）
     
     def __init__(self):
         """初始化分析器"""
@@ -238,10 +255,11 @@ class StockTrendAnalyzer:
         # 计算均线
         df = self._calculate_mas(df)
 
-        # 计算 MACD、RSI 和 ATR
+        # 计算 MACD、RSI、ATR 和 ADX
         df = self._calculate_macd(df)
         df = self._calculate_rsi(df)
         df = self._calculate_atr(df)
+        df = self._calculate_adx(df)
 
         # 获取最新数据
         latest = df.iloc[-1]
@@ -272,7 +290,10 @@ class StockTrendAnalyzer:
         # 7. ATR 分析（波动率，用于动态止损）
         self._analyze_atr(df, result)
 
-        # 8. 生成买入信号
+        # 8. ADX 分析（趋势强度，区分趋势行情 / 震荡行情）
+        self._analyze_adx(df, result)
+
+        # 9. 生成买入信号
         self._generate_signal(result)
 
         return result
@@ -415,6 +436,123 @@ class StockTrendAnalyzer:
         else:
             result.atr_signal = f"✅ 波动较小(ATR {atr_value:.2f}，占价 {ratio:.1f}%)，止损可收紧"
     
+    def _calculate_adx(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        计算 ADX 指标（平均趋向指标，Wilder DMI 三步法）
+
+        衡量趋势强度（不分多空方向）：
+        - ADX ≥ 25：强趋势（趋势行情，趋势策略有效）
+        - ADX < 20：无趋势（震荡行情，趋势策略易反复亏损）
+
+        公式：
+        - TR = max(high-low, |high-prev_close|, |low-prev_close|)（与 ATR 一致）
+        - +DM = (high - prev_high)，仅当其 > (prev_low - low) 且 > 0
+        - -DM = (prev_low - low)，仅当其 > (high - prev_high) 且 > 0
+        - +DI = 100 × Wilder平滑(+DM) / Wilder平滑(TR)
+        - -DI = 100 × Wilder平滑(-DM) / Wilder平滑(TR)
+        - DX = 100 × |+DI - -DI| / (+DI + -DI)
+        - ADX = Wilder平滑(DX)
+        """
+        df = df.copy()
+        period = self.ADX_PERIOD
+
+        prev_high = df['high'].shift(1)
+        prev_low = df['low'].shift(1)
+        prev_close = df['close'].shift(1)
+
+        # True Range（与 ATR 完全一致）
+        true_range = pd.concat([
+            df['high'] - df['low'],
+            (df['high'] - prev_close).abs(),
+            (df['low'] - prev_close).abs(),
+        ], axis=1).max(axis=1)
+
+        # 方向移动 +DM / -DM（仅当超出反向幅度且为正时计入）
+        up_move = df['high'] - prev_high
+        down_move = prev_low - df['low']
+        plus_dm = pd.Series(
+            np.where((up_move > down_move) & (up_move > 0), up_move, 0.0),
+            index=df.index,
+        )
+        minus_dm = pd.Series(
+            np.where((down_move > up_move) & (down_move > 0), down_move, 0.0),
+            index=df.index,
+        )
+
+        # Wilder 平滑（ewm alpha=1/period，与 ATR / RSI 一致）
+        atr_smoothed = true_range.ewm(alpha=1 / period, adjust=False).mean()
+        plus_dm_ma = plus_dm.ewm(alpha=1 / period, adjust=False).mean()
+        minus_dm_ma = minus_dm.ewm(alpha=1 / period, adjust=False).mean()
+
+        # +DI / -DI（除零保护）
+        plus_di = pd.Series(
+            np.where(atr_smoothed > 0, 100 * plus_dm_ma / atr_smoothed, 0.0),
+            index=df.index,
+        )
+        minus_di = pd.Series(
+            np.where(atr_smoothed > 0, 100 * minus_dm_ma / atr_smoothed, 0.0),
+            index=df.index,
+        )
+
+        # DX → ADX
+        di_sum = plus_di + minus_di
+        dx = pd.Series(
+            np.where(di_sum > 0, 100 * (plus_di - minus_di).abs() / di_sum, 0.0),
+            index=df.index,
+        )
+        adx = dx.ewm(alpha=1 / period, adjust=False).mean()
+
+        df[f'ADX_{period}'] = adx
+        df[f'+DI_{period}'] = plus_di
+        df[f'-DI_{period}'] = minus_di
+        return df
+
+    def _analyze_adx(self, df: pd.DataFrame, result: TrendAnalysisResult) -> None:
+        """
+        分析 ADX 指标（趋势强度）
+
+        核心判断：
+        - ADX ≥ 25：强趋势，配合 +DI/-DI 判断多空方向
+        - 20 ≤ ADX < 25：趋势形成中，观望
+        - ADX < 20：无趋势（震荡），趋势策略易失效
+        """
+        # ADX 至少需要 2×period 根 K 线才稳定（Wilder 平滑收敛）
+        if len(df) < self.ADX_PERIOD * 2:
+            result.adx_signal = "数据不足"
+            return
+
+        latest = df.iloc[-1]
+        period = self.ADX_PERIOD
+        adx_val = float(latest[f'ADX_{period}'])
+        plus_di = float(latest[f'+DI_{period}'])
+        minus_di = float(latest[f'-DI_{period}'])
+
+        # 容错：NaN 或异常值
+        if adx_val != adx_val or adx_val < 0:
+            result.adx_signal = "数据异常，无法判断趋势强度"
+            return
+
+        result.adx = adx_val
+        result.plus_di = plus_di
+        result.minus_di = minus_di
+
+        # 趋势强度分级（Wilder 经典阈值）
+        if adx_val >= self.ADX_STRONG_TREND:
+            direction = "多头主导" if plus_di > minus_di else ("空头主导" if minus_di > plus_di else "多空均衡")
+            result.adx_status = "强趋势"
+            result.adx_signal = (
+                f"🔥 强趋势(ADX {adx_val:.1f}≥{self.ADX_STRONG_TREND:.0f}，{direction}，适合趋势策略)"
+            )
+        elif adx_val >= self.ADX_WEAK_TREND:
+            result.adx_status = "趋势形成中"
+            result.adx_signal = f"📊 趋势形成中(ADX {adx_val:.1f})，观望方向选择"
+        else:
+            result.adx_status = "无趋势"
+            result.adx_signal = (
+                f"⚠️ 无趋势(ADX {adx_val:.1f}<{self.ADX_WEAK_TREND:.0f}，震荡行情，"
+                f"趋势策略易反复亏，宜区间操作或观望)"
+            )
+
     def _analyze_trend(self, df: pd.DataFrame, result: TrendAnalysisResult) -> None:
         """
         分析趋势状态
@@ -865,6 +1003,10 @@ class StockTrendAnalyzer:
             f"   ATR(14): {result.atr:.2f}",
             f"   占价比: {result.atr_ratio:.1f}%",
             f"   信号: {result.atr_signal}",
+            f"",
+            f"📊 ADX趋势强度: {result.adx_status or 'N/A'}",
+            f"   ADX(14): {result.adx:.1f}  +DI: {result.plus_di:.1f}  -DI: {result.minus_di:.1f}",
+            f"   信号: {result.adx_signal}",
             f"",
             f"🎯 操作建议: {result.buy_signal.value}",
             f"   综合评分: {result.signal_score}/100",
