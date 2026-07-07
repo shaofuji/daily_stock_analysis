@@ -1289,6 +1289,15 @@ class NotificationService(
                             f"{labels['trend_strength_label']}: {trend_data.get('trend_score', 'N/A')}/100",
                             "",
                         ])
+                        # 趋势三件套：波动(ATR) + 强度(ADX)，算法层注入，存在则展示
+                        _atr = trend_data.get('atr')
+                        _adx = trend_data.get('adx')
+                        if _atr not in (None, '', 'N/A') or _adx not in (None, '', 'N/A'):
+                            report_lines.extend([
+                                f"**波动与趋势**: ATR {_atr}（占价 {trend_data.get('atr_ratio', 'N/A')}%）"
+                                f" | ADX {_adx} {trend_data.get('adx_status', '')}",
+                                "",
+                            ])
                     # 价格位置
                     if price_data:
                         bias_status = price_data.get('bias_status', 'N/A')

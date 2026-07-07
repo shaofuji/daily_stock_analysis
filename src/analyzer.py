@@ -981,6 +981,29 @@ def fill_price_position_if_needed(
         if filled:
             dp["price_position"] = pp
             logger.info("[price_position] Filled placeholder fields from computed data")
+
+        # 补充趋势强度指标（ATR/ADX）到 trend_status，供报告展示
+        # AI 生成的 dashboard 通常不含这些算法字段，这里从 trend_result 注入
+        if trend_result:
+            tr_ind = trend_result if isinstance(trend_result, dict) else (
+                trend_result.__dict__ if hasattr(trend_result, "__dict__") else {}
+            )
+            ts = dp.get("trend_status")
+            if not isinstance(ts, dict):
+                ts = {}
+            atr_val = tr_ind.get("atr")
+            adx_val = tr_ind.get("adx")
+            if atr_val or adx_val:
+                def _r2(v):
+                    try:
+                        return round(float(v), 2)
+                    except (TypeError, ValueError):
+                        return v
+                ts["atr"] = _r2(atr_val)
+                ts["atr_ratio"] = _r2(tr_ind.get("atr_ratio"))
+                ts["adx"] = _r2(adx_val)
+                ts["adx_status"] = tr_ind.get("adx_status")
+                dp["trend_status"] = ts
     except Exception as e:
         logger.warning("[price_position] Fill failed, skipping: %s", e)
 
